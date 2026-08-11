@@ -80,6 +80,7 @@ def _discord_request(method, path, params=None, body=None, attempts=3):
             req = urllib.request.Request(url, data=data, method=method)
             req.add_header("Authorization", f"Bot {BOT_TOKEN}")
             req.add_header("Content-Type", "application/json")
+            req.add_header("User-Agent", "OverthrowSalesLeaderboardBot (https://github.com, 1.0)")
             with urllib.request.urlopen(req, timeout=20) as resp:
                 raw = resp.read()
                 return json.loads(raw) if raw else None
