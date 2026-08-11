@@ -2,10 +2,12 @@ name: Nightly Sales Leaderboard
 
 on:
   schedule:
-    # Runs every hour, every day. The script itself checks whether it's
-    # actually 10 PM Mountain Time before doing anything, so this doesn't
-    # need to change for Daylight Saving Time and can't post twice.
-    - cron: '0 * * * *'
+  # Runs every 10 minutes, every day. The script itself checks the time in
+    # Mountain Time and decides what to do: update the running "live"
+    # leaderboard during the day (7 AM-10 PM, Mon-Sat), post the final
+    # leaderboard at 10 PM, or do nothing (nights, Sundays). This doesn't
+    # need to change for Daylight Saving Time and can't post/edit twice.
+    - cron: '*/10 * * * *'
   workflow_dispatch: {}   # lets you click "Run workflow" on GitHub to test it manually
 
 jobs:
