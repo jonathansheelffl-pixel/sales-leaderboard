@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-Overthrow — Nightly Sales Leaderboard
+Overthrow — Sales Leaderboard (one running message per day)
 
-Runs every hour (triggered by GitHub Actions). Only does real work when it's
-actually ~10 PM Mountain Time on a Monday-Saturday. Tallies dollar amounts
-posted in #daily-sales for the day and posts a ranked leaderboard to
-#daily-sales-leaderboard.
+Runs every 10 minutes (triggered by GitHub Actions). Mountain Time drives
+all the decisions, handled automatically for Daylight Saving Time:
+
+  - 7:00 AM - 9:59 PM, Monday-Saturday: keeps ONE message per day in
+    #daily-sales-leaderboard, editing it in place as sales come in, so
+    anyone can check who's on top at any point during the day.
+  - 10:00 PM, Monday-Saturday: edits that same message one last time to
+    turn it into the final, permanent record for the day (no separate
+    message posted) and stops touching it.
+  - Sunday, and outside the 7 AM-10 PM window: does nothing.
 
 Design goals (this replaces a flaky AI-agent-based version):
   - Zero third-party dependencies (stdlib only) so there's nothing extra to
@@ -14,9 +20,9 @@ Design goals (this replaces a flaky AI-agent-based version):
     a real failure.
   - If anything at all goes wrong, it posts a visible "something broke"
     alert to the leaderboard channel instead of failing silently.
-  - It's safe to run more than once in the same hour/day — it checks what's
-    already been posted before posting again.
-  - Handles Daylight Saving Time automatically (America/Denver timezone).
+  - No external storage needed — it figures out what's already been posted
+    by reading recent messages in the channel, so it's safe to run as often
+    as you like without double-posting or duplicating the live message.
 """
 
 import json
@@ -44,6 +50,14 @@ API_BASE = "https://discord.com/api/v10"
 
 DOLLAR_PATTERN = re.compile(r"\$[0-9][0-9,]*(?:\.[0-9]{2})?")
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+FINAL_PREFIX = "🏆 DAILY SALES LEADERBOARD"
+LIVE_PREFIX = "📊 LIVE LEADERBOARD"
+ALERT_MARKER = "failed to complete"
+
+RECENT_SCAN_LIMIT = 20   # how many recent leaderboard-channel messages to check
+LIVE_WINDOW_START_HOUR = 7    # 7 AM Mountain
+FINAL_POST_HOUR = 22          # 10 PM Mountain
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +119,14 @@ def create_message(channel_id, content):
     )
 
 
+def edit_message(channel_id, message_id, content):
+    return _discord_request(
+        "PATCH",
+        f"/channels/{channel_id}/messages/{message_id}",
+        body={"content": content, "allowed_mentions": {"parse": []}},
+    )
+
+
 def fetch_recent_messages(channel_id, lookback_hours):
     """Fetch all messages newer than `lookback_hours` ago, paginating as needed."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
@@ -152,23 +174,123 @@ def tally_day(messages, day_start_utc, day_end_utc):
     return totals
 
 
-def format_leaderboard(date_label, totals, suffix=""):
-    header = f"🏆 DAILY SALES LEADERBOARD — {date_label}{suffix}"
-    if not totals:
-        return f"{header}\nNo sales posted in #daily-sales today. Get after it tomorrow! 💪"
+def format_leaderboard(header, totals, empty_text, footer_extra=None, limit=10):
+    """Build the leaderboard message text.
 
-    ranked = sorted(totals.items(), key=lambda kv: -kv[1])[:10]
+    `limit` caps how many people are listed (final leaderboard shows the
+    top 10, as originally specified). Pass limit=None to list everyone who
+    has at least one sale — used for the running/live leaderboard so no one
+    who sold a policy is left off.
+    """
+    if not totals:
+        lines = [header, empty_text]
+        if footer_extra:
+            lines.append(footer_extra)
+        return "\n".join(lines)
+
+    ranked = sorted(totals.items(), key=lambda kv: -kv[1])
+    if limit is not None:
+        ranked = ranked[:limit]
     lines = [header, "━" * 32]
     for i, (name, amount) in enumerate(ranked, start=1):
         prefix = MEDALS.get(i, f"{i}.")
         lines.append(f"{prefix} {name} — ${amount:,.0f}")
     lines.append("━" * 32)
     lines.append(f"💰 Team total: ${sum(totals.values()):,.0f}")
+    if footer_extra:
+        lines.append(footer_extra)
     return "\n".join(lines)
 
 
 def date_label(d):
     return d.strftime("%B ") + str(d.day) + d.strftime(", %Y")
+
+
+def find_message(recent_msgs, prefix, marker):
+    """Find the most recent message starting with `prefix` and containing `marker`."""
+    for m in recent_msgs:
+        content = m.get("content", "") or ""
+        if content.startswith(prefix) and marker in content:
+            return m
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Live (running-total) leaderboard
+# ---------------------------------------------------------------------------
+
+def do_live_update(recent, now, today, today_lbl):
+    hours_since_midnight = now.hour + now.minute / 60 + 0.5  # small buffer
+    sales_msgs = fetch_recent_messages(SALES_CHANNEL_ID, lookback_hours=hours_since_midnight)
+
+    t_start, t_end = mountain_day_bounds(today)
+    totals = tally_day(sales_msgs, t_start, t_end)
+
+    header = f"{LIVE_PREFIX} — {today_lbl}"
+    body = format_leaderboard(
+        header,
+        totals,
+        empty_text="No sales posted yet today — check back soon!",
+        limit=None,  # show everyone who has sold, not just the top 10
+    )
+
+    existing = find_message(recent, LIVE_PREFIX, today_lbl)
+    if existing:
+        edit_message(LEADERBOARD_CHANNEL_ID, existing["id"], body)
+        print("Live leaderboard edited.")
+    else:
+        create_message(LEADERBOARD_CHANNEL_ID, body)
+        print("Live leaderboard created.")
+
+
+# ---------------------------------------------------------------------------
+# Final (permanent, once-nightly) leaderboard
+# ---------------------------------------------------------------------------
+
+def do_backfill_if_needed(recent, yesterday, yesterday_lbl):
+    """Self-healing: post yesterday's leaderboard as a new message if it's
+    missing and yesterday was a day this automation should have run."""
+    if yesterday.weekday() == 6:
+        return
+    if find_message(recent, FINAL_PREFIX, yesterday_lbl):
+        return
+
+    sales_msgs = fetch_recent_messages(SALES_CHANNEL_ID, lookback_hours=50)
+    y_start, y_end = mountain_day_bounds(yesterday)
+    y_totals = tally_day(sales_msgs, y_start, y_end)
+    backfill_header = f"{FINAL_PREFIX} — {yesterday_lbl} (auto-recovered — last night's run didn't post)"
+    backfill_text = format_leaderboard(
+        backfill_header, y_totals, empty_text="No sales posted in #daily-sales that day.", limit=None
+    )
+    create_message(LEADERBOARD_CHANNEL_ID, backfill_text)
+
+
+def do_finalize(recent, today, today_lbl):
+    """Turn today's running message into the final, permanent record.
+
+    If a live message already exists for today, this EDITS that same
+    message in place (no new message posted). If somehow no live message
+    exists yet (e.g. every earlier run today failed), it posts a fresh one.
+    """
+    sales_msgs = fetch_recent_messages(SALES_CHANNEL_ID, lookback_hours=26)
+    t_start, t_end = mountain_day_bounds(today)
+    totals = tally_day(sales_msgs, t_start, t_end)
+
+    header = f"{FINAL_PREFIX} — {today_lbl}"
+    body = format_leaderboard(
+        header,
+        totals,
+        empty_text="No sales posted in #daily-sales today. Get after it tomorrow! 💪",
+        limit=None,  # show everyone who sold, not just the top 10
+    )
+
+    existing = find_message(recent, LIVE_PREFIX, today_lbl)
+    if existing:
+        edit_message(LEADERBOARD_CHANNEL_ID, existing["id"], body)
+        print("Finalized today's leaderboard (edited the running message into the final one).")
+    else:
+        create_message(LEADERBOARD_CHANNEL_ID, body)
+        print("Finalized today's leaderboard (no running message existed yet, posted fresh).")
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +309,7 @@ def already_posted(recent_msgs, label):
     marker = f"— {label}"
     for m in recent_msgs:
         content = m.get("content", "") or ""
-        if content.startswith("🏆 DAILY SALES LEADERBOARD") and marker in content:
+        if content.startswith(FINAL_PREFIX) and marker in content:
             return True
     return False
 
@@ -198,14 +320,9 @@ def run():
 
     now = datetime.now(MOUNTAIN_TZ)
 
-    # Only run Monday(0)-Saturday(5); never Sunday(6)
+    # Never run on Sunday
     if now.weekday() == 6:
         print("It's Sunday in Mountain Time — nothing to do.")
-        return
-
-    # Only do real work in the 10 PM hour, Mountain Time
-    if now.hour != 22:
-        print(f"Not the 10 PM Mountain hour yet (currently {now.hour}:00 local) — skipping.")
         return
 
     today = now.date()
@@ -213,35 +330,29 @@ def run():
     today_lbl = date_label(today)
     yesterday_lbl = date_label(yesterday)
 
-    recent = list_messages(LEADERBOARD_CHANNEL_ID, limit=5)
+    recent = list_messages(LEADERBOARD_CHANNEL_ID, limit=RECENT_SCAN_LIMIT)
 
-    # Idempotency: if today's leaderboard (or today's alert) already went out, stop.
-    if already_posted(recent, today_lbl):
-        print("Today's leaderboard was already posted — skipping.")
+    # If today's final leaderboard (or today's failure alert) already went out,
+    # the day is done — no more live updates, no re-posting.
+    if find_message(recent, FINAL_PREFIX, today_lbl):
+        print("Today's final leaderboard was already posted — nothing more to do today.")
         return
     for m in recent:
-        if today_lbl in (m.get("content") or "") and "failed to complete" in (m.get("content") or ""):
-            print("Today's failure alert was already posted — skipping.")
+        content = m.get("content", "") or ""
+        if today_lbl in content and ALERT_MARKER in content:
+            print("Today's failure alert was already posted — nothing more to do today.")
             return
 
-    # Self-healing: back-fill yesterday if it's missing and yesterday was a run day (Mon-Sat)
-    if yesterday.weekday() != 6 and not already_posted(recent, yesterday_lbl):
-        sales_msgs = fetch_recent_messages(SALES_CHANNEL_ID, lookback_hours=50)
-        y_start, y_end = mountain_day_bounds(yesterday)
-        y_totals = tally_day(sales_msgs, y_start, y_end)
-        backfill_text = format_leaderboard(
-            yesterday_lbl, y_totals, suffix=" (auto-recovered — last night's run didn't post)"
-        )
-        create_message(LEADERBOARD_CHANNEL_ID, backfill_text)
-    else:
-        sales_msgs = fetch_recent_messages(SALES_CHANNEL_ID, lookback_hours=26)
+    if now.hour == FINAL_POST_HOUR:
+        do_backfill_if_needed(recent, yesterday, yesterday_lbl)
+        do_finalize(recent, today, today_lbl)
+        return
 
-    # Today's leaderboard
-    t_start, t_end = mountain_day_bounds(today)
-    t_totals = tally_day(sales_msgs, t_start, t_end)
-    today_text = format_leaderboard(today_lbl, t_totals)
-    create_message(LEADERBOARD_CHANNEL_ID, today_text)
-    print("Posted today's leaderboard successfully.")
+    if now.hour < LIVE_WINDOW_START_HOUR:
+        print(f"Before the {LIVE_WINDOW_START_HOUR}:00 AM Mountain live window — skipping.")
+        return
+
+    do_live_update(recent, now, today, today_lbl)
 
 
 def main():
@@ -252,11 +363,16 @@ def main():
         # Last-resort safety net: try hard to get an alert posted even if
         # something above broke badly. This block deliberately avoids
         # relying on anything that could itself be the cause of failure.
-        try:
-            post_failure_alert(reason=str(e))
-        except Exception as e2:
-            print(f"Also failed to post the failure alert: {e2}", file=sys.stderr)
-            sys.exit(1)
+        # (Only fires for the final/backfill path failing, not for a missed
+        # live update — a live-update hiccup will just be corrected on the
+        # next run 10 minutes later.)
+        now = datetime.now(MOUNTAIN_TZ)
+        if now.weekday() != 6 and now.hour == FINAL_POST_HOUR:
+            try:
+                post_failure_alert(reason=str(e))
+            except Exception as e2:
+                print(f"Also failed to post the failure alert: {e2}", file=sys.stderr)
+                sys.exit(1)
         sys.exit(1)
 
 
