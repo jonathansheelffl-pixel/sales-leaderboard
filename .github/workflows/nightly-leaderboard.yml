@@ -1,0 +1,26 @@
+name: Nightly Sales Leaderboard
+
+on:
+  schedule:
+    # Runs every hour, every day. The script itself checks whether it's
+    # actually 10 PM Mountain Time before doing anything, so this doesn't
+    # need to change for Daylight Saving Time and can't post twice.
+    - cron: '0 * * * *'
+  workflow_dispatch: {}   # lets you click "Run workflow" on GitHub to test it manually
+
+jobs:
+  post-leaderboard:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run leaderboard script
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+        run: python leaderboard.py
