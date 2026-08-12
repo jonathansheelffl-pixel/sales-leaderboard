@@ -161,7 +161,11 @@ def mountain_day_bounds(local_date):
 
 
 def tally_day(messages, day_start_utc, day_end_utc):
+    """Returns (totals, counts) — dollar totals and number of individual
+    sales (policies) per author. A single message can contain more than one
+    sale, so each dollar amount found counts as one policy."""
     totals = defaultdict(float)
+    counts = defaultdict(int)
     for m in messages:
         ts = datetime.fromisoformat(m["timestamp"])
         if not (day_start_utc <= ts < day_end_utc):
@@ -172,10 +176,11 @@ def tally_day(messages, day_start_utc, day_end_utc):
         author = m["author"].get("global_name") or m["author"].get("username") or "Unknown"
         for match in matches:
             totals[author] += float(match.replace("$", "").replace(",", ""))
-    return totals
+            counts[author] += 1
+    return totals, counts
 
 
-def format_leaderboard(header, totals, empty_text, footer_extra=None, limit=10):
+def format_leaderboard(header, totals, counts, empty_text, footer_extra=None, limit=10):
     """Build the leaderboard message text.
 
     `limit` caps how many people are listed (final leaderboard shows the
@@ -195,9 +200,13 @@ def format_leaderboard(header, totals, empty_text, footer_extra=None, limit=10):
     lines = [header, "━" * 32]
     for i, (name, amount) in enumerate(ranked, start=1):
         prefix = MEDALS.get(i, f"{i}.")
-        lines.append(f"{prefix} {name} — ${amount:,.0f}")
+        n = counts.get(name, 0)
+        sale_word = "sale" if n == 1 else "sales"
+        lines.append(f"{prefix} {name} — ${amount:,.0f} ({n} {sale_word})")
     lines.append("━" * 32)
-    lines.append(f"💰 Team total: ${sum(totals.values()):,.0f}")
+    total_sales = sum(counts.values())
+    total_word = "sale" if total_sales == 1 else "sales"
+    lines.append(f"💰 Team total: ${sum(totals.values()):,.0f} ({total_sales} {total_word})")
     if footer_extra:
         lines.append(footer_extra)
     return "\n".join(lines)
@@ -225,12 +234,13 @@ def do_live_update(recent, now, today, today_lbl):
     sales_msgs = fetch_recent_messages(SALES_CHANNEL_ID, lookback_hours=hours_since_midnight)
 
     t_start, t_end = mountain_day_bounds(today)
-    totals = tally_day(sales_msgs, t_start, t_end)
+    totals, counts = tally_day(sales_msgs, t_start, t_end)
 
     header = f"{LIVE_PREFIX} — {today_lbl}"
     body = format_leaderboard(
         header,
         totals,
+        counts,
         empty_text="No sales posted yet today — check back soon!",
         limit=None,  # show everyone who has sold, not just the top 10
     )
@@ -258,10 +268,14 @@ def do_backfill_if_needed(recent, yesterday, yesterday_lbl):
 
     sales_msgs = fetch_recent_messages(SALES_CHANNEL_ID, lookback_hours=50)
     y_start, y_end = mountain_day_bounds(yesterday)
-    y_totals = tally_day(sales_msgs, y_start, y_end)
+    y_totals, y_counts = tally_day(sales_msgs, y_start, y_end)
     backfill_header = f"{FINAL_PREFIX} — {yesterday_lbl} (auto-recovered — last night's run didn't post)"
     backfill_text = format_leaderboard(
-        backfill_header, y_totals, empty_text="No sales posted in #daily-sales that day.", limit=None
+        backfill_header,
+        y_totals,
+        y_counts,
+        empty_text="No sales posted in #daily-sales that day.",
+        limit=None,
     )
     create_message(LEADERBOARD_CHANNEL_ID, backfill_text)
 
@@ -275,12 +289,13 @@ def do_finalize(recent, today, today_lbl):
     """
     sales_msgs = fetch_recent_messages(SALES_CHANNEL_ID, lookback_hours=26)
     t_start, t_end = mountain_day_bounds(today)
-    totals = tally_day(sales_msgs, t_start, t_end)
+    totals, counts = tally_day(sales_msgs, t_start, t_end)
 
     header = f"{FINAL_PREFIX} — {today_lbl}"
     body = format_leaderboard(
         header,
         totals,
+        counts,
         empty_text="No sales posted in #daily-sales today. Get after it tomorrow! 💪",
         limit=None,  # show everyone who sold, not just the top 10
     )
@@ -304,15 +319,6 @@ def post_failure_alert(reason=""):
     if reason:
         print(f"Posting failure alert. Reason: {reason}", file=sys.stderr)
     create_message(LEADERBOARD_CHANNEL_ID, msg)
-
-
-def already_posted(recent_msgs, label):
-    marker = f"— {label}"
-    for m in recent_msgs:
-        content = m.get("content", "") or ""
-        if content.startswith(FINAL_PREFIX) and marker in content:
-            return True
-    return False
 
 
 def run():
