@@ -389,6 +389,47 @@ def post_weekly_failure_alert(week_lbl, reason=""):
 # Final (permanent, once-nightly) leaderboard
 # ---------------------------------------------------------------------------
 
+def catch_up_missed_days(recent, today, days_back=7):
+    """Self-heal after an outage: finalize any earlier day (Mon-Sat) from the
+    last week whose leaderboard never got its final version. Edits the day's
+    running message into the final one if it exists, otherwise posts it."""
+    missing = []
+    for n in range(1, days_back + 1):
+        d = today - timedelta(days=n)
+        if d.weekday() == 6:
+            continue
+        lbl = date_label(d)
+        if find_message(recent, FINAL_PREFIX, lbl):
+            continue
+        missing.append((d, lbl))
+    if not missing:
+        return False
+
+    oldest = min(d for d, _ in missing)
+    start_utc, _ = mountain_day_bounds(oldest)
+    hours = (datetime.now(timezone.utc) - start_utc).total_seconds() / 3600 + 1
+    sales_msgs = fetch_recent_messages(SALES_CHANNEL_ID, lookback_hours=hours)
+
+    for d, lbl in sorted(missing):
+        s, e = mountain_day_bounds(d)
+        totals, counts = tally_day(sales_msgs, s, e)
+        body = format_leaderboard(
+            f"{FINAL_PREFIX} — {lbl}",
+            totals,
+            counts,
+            empty_text="No sales posted in #daily-sales that day.",
+            limit=None,
+        )
+        existing = find_message(recent, LIVE_PREFIX, lbl)
+        if existing:
+            edit_message(LEADERBOARD_CHANNEL_ID, existing["id"], body)
+            print(f"Caught up {lbl} (edited its running message into the final).")
+        else:
+            create_message(LEADERBOARD_CHANNEL_ID, body)
+            print(f"Caught up {lbl} (posted the final).")
+    return True
+
+
 def do_backfill_if_needed(recent, yesterday, yesterday_lbl):
     """Self-healing: post yesterday's leaderboard as a new message if it's
     missing and yesterday was a day this automation should have run."""
@@ -487,6 +528,11 @@ def run():
 
     recent = list_messages(LEADERBOARD_CHANNEL_ID, limit=RECENT_SCAN_LIMIT)
     recent_weekly = list_messages(WEEKLY_LEADERBOARD_CHANNEL_ID, limit=RECENT_SCAN_LIMIT)
+
+    # Catch up on any earlier day whose final leaderboard never got posted
+    # (e.g. after an outage), before handling today.
+    if catch_up_missed_days(recent, today):
+        recent = list_messages(LEADERBOARD_CHANNEL_ID, limit=RECENT_SCAN_LIMIT)
 
     # Monday-morning self-heal: make sure last week's final got posted before
     # this week's numbers start rolling in.
