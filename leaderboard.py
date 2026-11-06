@@ -13,7 +13,7 @@ all the decisions, handled automatically for Daylight Saving Time:
   - 10:00 PM, Monday-Saturday: edits today's message one last time to turn
     it into the final, permanent record for the day (no separate message
     posted) and stops touching it. The weekly message keeps rolling.
-  - 5:00 PM, Sunday: edits the week's running message one last time to turn
+  - 11:50 PM, Sunday: edits the week's running message one last time to turn
     it into the final, permanent record for the week, then stops touching
     it until Monday.
   - Sunday outside 5 PM, and Mon-Sat outside the 7 AM-10 PM window: does
@@ -68,7 +68,8 @@ RECENT_SCAN_LIMIT = 20   # how many recent leaderboard-channel messages to check
 LIVE_WINDOW_START_HOUR = 7    # 7 AM Mountain
 FINAL_POST_HOUR = 22          # 10 PM Mountain
 WEEK_FINALIZE_WEEKDAY = 6     # Sunday (Monday=0 ... Sunday=6)
-WEEK_FINALIZE_HOUR = 17       # 5 PM Mountain
+WEEK_FINALIZE_HOUR = 23       # 11 PM Mountain...
+WEEK_FINALIZE_MINUTE = 50     # ...from 11:50 PM on (Sunday cutoff for the weekly leaderboard)
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +247,13 @@ def format_leaderboard(header, totals, counts, empty_text, footer_extra=None, li
     if footer_extra:
         lines.append(footer_extra)
     return "\n".join(lines)
+
+
+def is_week_finalize_time(now):
+    """True from 11:50 PM to 11:59 PM Mountain on Sunday."""
+    return (now.weekday() == WEEK_FINALIZE_WEEKDAY
+            and now.hour == WEEK_FINALIZE_HOUR
+            and now.minute >= WEEK_FINALIZE_MINUTE)
 
 
 def date_label(d):
@@ -504,7 +512,7 @@ def run():
 
     # ---- Weekly wrap-up: Sunday at 5 PM Mountain. This runs independently
     # of the daily Sunday skip below, since the week still needs to close. ----
-    if now.weekday() == WEEK_FINALIZE_WEEKDAY and now.hour == WEEK_FINALIZE_HOUR:
+    if is_week_finalize_time(now):
         recent_weekly = list_messages(WEEKLY_LEADERBOARD_CHANNEL_ID, limit=RECENT_SCAN_LIMIT)
         if find_message(recent_weekly, WEEKLY_FINAL_PREFIX, week_lbl):
             print("This week's final leaderboard was already posted — nothing more to do.")
@@ -517,9 +525,15 @@ def run():
         do_weekly_finalize(recent_weekly, week_start, week_end, week_lbl)
         return
 
-    # Never run the daily logic (or weekly live updates) on Sunday otherwise
+    # Sunday: no daily leaderboard, but keep the weekly one rolling until the
+    # 11:50 PM wrap-up above.
     if now.weekday() == 6:
-        print("It's Sunday in Mountain Time — nothing to do outside the 5 PM weekly wrap-up.")
+        if now.hour >= LIVE_WINDOW_START_HOUR:
+            recent_weekly = list_messages(WEEKLY_LEADERBOARD_CHANNEL_ID, limit=RECENT_SCAN_LIMIT)
+            if not find_message(recent_weekly, WEEKLY_FINAL_PREFIX, week_lbl):
+                do_live_weekly_update(recent_weekly, now, week_start, week_lbl)
+        else:
+            print("Sunday before the live window — nothing to do.")
         return
 
     yesterday = today - timedelta(days=1)
@@ -584,7 +598,7 @@ def main():
         # corrected on the next run 10 minutes later.)
         now = datetime.now(MOUNTAIN_TZ)
         try:
-            if now.weekday() == WEEK_FINALIZE_WEEKDAY and now.hour == WEEK_FINALIZE_HOUR:
+            if is_week_finalize_time(now):
                 week_start, week_end = week_bounds_for_date(now.date())
                 post_weekly_failure_alert(week_label(week_start, week_end), reason=str(e))
             elif now.weekday() != 6 and now.hour == FINAL_POST_HOUR:
