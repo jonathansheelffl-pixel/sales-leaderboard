@@ -10,6 +10,9 @@ on:
     - cron: '*/10 * * * *'
   workflow_dispatch: {}   # lets you click "Run workflow" on GitHub to test it manually
 
+permissions:
+  contents: write   # needed for the monthly keep-alive commit below
+
 jobs:
   post-leaderboard:
     runs-on: ubuntu-latest
@@ -26,3 +29,17 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
         run: python leaderboard.py
+
+      - name: Keep repository active
+        # GitHub switches off scheduled workflows after 60 days with no
+        # repository activity. Make a tiny empty commit if the last one is
+        # more than 30 days old so this never happens again.
+        run: |
+          last=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          if [ $((now - last)) -gt 2592000 ]; then
+            git config user.name "leaderboard-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git commit --allow-empty -m "chore: keep-alive commit"
+            git push
+          fi
